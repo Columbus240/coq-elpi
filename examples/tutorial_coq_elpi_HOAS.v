@@ -421,6 +421,9 @@ Elpi Query lp:{{
      For example:
 
        macro @pi-decl N T F :- pi x\ decl x N T => F x.
+
+     Remeber the precedence of lambda abstraction "x\" which lets you write the
+     following without parentheses for F.
 *)
 
 Elpi Query lp:{{
@@ -434,3 +437,233 @@ Elpi Query lp:{{
 }}.
 
 (** -------------------- Holes (implicit arguments) ----------------------- *)
+
+(**
+     An "Evar" (Coq slang for existentially quantified meta variable) is
+     reprsented as a Elpi unification variable and a typing constraint. *)
+
+Elpi Query lp:{{
+
+    T = {{ _ }},
+    coq.say "raw T =" T,
+    coq.sigma.print,
+    coq.say "--------------------------------------------------------",
+    coq.typecheck T {{ nat }} ok,
+    coq.sigma.print
+    
+}}.
+    
+(**
+     Before the call to coq.typecheck, Elpi just prints:
+
+       raw T = X0
+
+     After the call it also prints the following syntactic constraint:
+
+       evar X0 (global (indt «nat»)) X0  /* suspended on X0 */
+
+     which indicates that the hole X0 is expected to have type nat.
+
+     The API coq.sigma.print also dumps some debugging info: Coq's "evar_map"
+     and a bijective mapping from Coq evars to Elpi's unification variables.
+
+     Before the call the mapping is empty. After the call it prints:
+
+        Coq-Elpi mapping:
+        RAW:
+        ?X11 <-> X0
+        ELAB:
+        ?X11 <-> X0
+
+     Note that Coq's evar identifiers are of the form ?X<n>, while the Elpi ones
+     have no leading "?". The Coq "evar map" says that ?X11 has type nat:
+
+        EVARS:
+        ?X11==[ |- nat] (internal placeholder) {?e0}
+
+     The intuition is that Coq's evar map (AKA sigma or evd), which assigns
+     typing judgement to evars, is represented with Elpi consaints which carry
+     the same piece of info.
+
+     Naked Elpi unification variables, when passed to Coq's API, are
+     automatically linked to a Coq evar. We postpone the explanation of the
+     difference "raw" and "elab" unification variables to the chapter about
+     tactics, here the second copy of X0 in the evar constraint plays no role.
+
+     Now, what about the typing context?
+*)
+
+Elpi Query lp:{{
+
+  T = {{ fun x : nat => x + _ }},
+  coq.say "raw T =" T,
+  T = fun N Ty Bo,
+  @pi-decl N Ty x\
+      coq.typecheck (Bo x) {{ nat }} ok,
+      coq.sigma.print.
+
+}}.
+
+(**
+    Here we can see that the hole in "x + _", which occurs under the
+    binder "c0\", is represented by an Elpi unification variable "X0 c0", that
+    means that X0 sees c0 (c0 is in the scope of X0).
+ 
+     raw T = 
+       fun `x` (global (indt «nat»)) c0 \
+         app [global (const «Nat.add»), c0, X0 c0]
+ 
+    This time the constraint is
+ 
+      {c0 c1} :
+        decl c1 `x` (global (indt «nat»)) ?-
+          evar (X0 c1) (global (indt «nat»)) (X0 c1)  /* suspended on X0 */
+ 
+    Here {...} is the set of names (not necessarily minimized) used in the
+    constraint, while ?- separates the assumptions from the conclusion.
+ 
+    The mapping between Coq and Elpi is ?X13 <-> X0, where
+ 
+      EVARS:
+        ?X13==[x |- nat] (internal placeholder) {?e0}
+ 
+    As expected both Elpi's constraint and Coq's evar map record a context
+    for a variable "x" (of type nat) which is in the scope of the hole.
+ 
+    Unless one is writing a tactic, Elpi's constraints are just used to
+    represent the evar map entry of evars. When a variable is assigned to a
+    term the corresponding constraint is dropped. When one is writing a tactic,
+    things are wired up so that assigning a term to an Elpi variable
+    representing an evar resumes a type checking goal to ensure the term has
+    the expected type.
+    We will explain this in detail in the chapter about tactics.
+
+*)
+
+(**
+    This encoding of evars is such that the programmer does not need to care
+    much about them: no need to carry around an assignment/typing map like the
+    evar map, no need to declared new variables there, etc. The programmer
+    can freely call Coq API passing an Elpi term containing holes.
+
+    There is one limitation, though. The rest of this chapter describes it
+    and introduces a few APIs and options to deal with it.
+
+    The limitation is that the automatic declaration and mapping
+    does not work in all situations. In particular it only works for Elpi
+    unification variables which are in the pattern fragment, which mean
+    that they are applied only to distinct names (bound variables).
+
+    This is the case for all the {{ _ }} one uses inside quotations, for
+    example, but it is not hard to craft a term outside this fragment.
+    In particular we can use Elpi's substitution (function application) to
+    put an arbitrary term in place of a bound variable.
+
+*) 
+
+Fail Elpi Query lp:{{
+
+  T = {{ fun x : nat => x + _ }},
+  T = fun N Ty Bo,      % remark the hole sees x
+  Bo1 = Bo {{ 1 }},     % 1 is the offending term we put in place of x
+  coq.say "Bo1 =" Bo1,  % Bo1 is outside the pattern fragment
+  coq.typecheck Bo1 {{ nat }} ok. % boom
+
+}}.
+
+(**
+    This snippet fails hard, with the following message:
+
+        Flexible term outside pattern fragment:
+        X0 (app [global (indc «S»), global (indc «O»)])
+
+    Indeed Bo1
+
+      app
+      [global (const «Nat.add»), 
+        app [global (indc «S»), global (indc «O»)], 
+        X0 (app [global (indc «S»), global (indc «O»)])]
+
+    contains a term outside the pattern fragment, the second argument of plus,
+    which is obtained by replacing c0 with {{ 1 }} in "X0 c0".
+
+    While programming Coq extensions in Elpi, it may happen that we want use a
+    Coq term as a syntax tree (with holes) and we need to apply substitutions to
+    it but we don't really care about the scope of holes, we would like these
+    holes to stay {{ _ }} (a fresh hole which sees the entire context of bound
+    variables). In some sense, we would like {{ _ }} to be a special dummy
+    constant, to be turned into an actual hole on the fly when needed.
+
+    This use case is perfectly legitimate and is supported by all APIs taking
+    terms in input thanks to the @holes! option.
+    
+*)
+
+Elpi Query lp:{{
+
+  T = {{ fun x : nat => x + _ }},
+  T = fun N Ty Bo,
+  Bo1 = Bo {{ 1 }},
+  coq.say "Bo1 =" Bo1,
+  @holes! => coq.typecheck Bo1 {{ nat }} ok,
+  coq.say "Bo1 =" Bo1.
+
+}}.
+
+(**
+
+    Note that after the call to coq.typecheck X0 is assigned with _\X1, that is,
+    the offending argument has been pruned.
+    
+      Bo1 = app
+        [global (const «Nat.add»), 
+           app [global (indc «S»), global (indc «O»)],
+           X1]
+
+    All APIs taking a term support this option which is documented in details
+    in https://github.com/LPCIC/coq-elpi/blob/master/coq-builtin.elpi
+
+    In addition to @holes! option, there is a class of API which can deal with
+    terms outside the pattern fragment are the ones taking in input a term
+    skeleton. A skeleton is not modified in place, as coq.typecheck does with
+    its first input, but is rather elaborated to a term related to it.
+    In some sense APIs taking a skeleton are more powerful, because the can
+    modify the structure of the term, eg. insert a coercions, but are less
+    precise, in the sense that the relation between the input and the output
+    terms is not straightforward (it's not unification).
+
+*)
+
+Coercion nat2bool n := match n with O => false | _ => true end.
+Open Scope bool_scope.
+
+Elpi Query lp:{{
+
+  T = {{ fun x : nat => x && _ }},
+  T = fun N Ty Bo,
+  Bo1 = Bo {{ 1 }},
+  coq.elaborate-skeleton Bo1 {{ bool }} Bo2 ok,
+  coq.say "Bo1 =" Bo1, % we print it after the call, to see if it changed
+  coq.say "Bo2 =" Bo2.
+
+}}.
+
+(**
+    Here Bo2 is obtained by taking Bo1, considering all unification variables 
+    as holes and all type levels as fresh (the are none in this example), and
+    running Coq's elaborator on it:
+    
+      Bo2 = 
+        app [global (const «andb»), 
+             app [global (const «nat2bool»),
+                  app [global (indc «S»), global (indc «O»)]],
+             X1]
+
+    The result is a term with a similar structure (skeleton), but a coercion
+    is inserted to make "x" fit as a boolean value, and a fresh hole X1 is
+    put in place of the term "X0 (app [global (indc «S»), global (indc «O»)])"
+    which is left untouched.
+
+    Skeletons and their APIs are described in more details in the chapter
+    on commands.
+*)
